@@ -1,0 +1,15 @@
+services:
+  voice:
+    build: .
+    restart: unless-stopped
+    environment:
+      - CORE_WS_URL=${CORE_WS_URL:-ws://bot:8765}
+      - RUNNER_SECRET=${RUNNER_SECRET:-}
+      - RUNNER_REGION=${RUNNER_REGION:-}
+    networks:
+      - fluxcord-net
+
+networks:
+  fluxcord-net:
+    external: true
+    name: fluxcord-net
