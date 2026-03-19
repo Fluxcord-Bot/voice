@@ -226,7 +226,7 @@ async function main() {
   });
 
   log(`Connecting to Fluxer at ${LIVEKIT_URL}`);
-  // @ts-ignore - RoomOptions/TrackPublishOptions are protobuf types; partial objects are valid at runtime
+  // @ts-ignore
   await room.connect(LIVEKIT_URL, LIVEKIT_TOKEN, { autoSubscribe: true });
   // @ts-ignore
   await room.localParticipant?.publishTrack(lkTrack, { source: TrackSource.SOURCE_MICROPHONE });
