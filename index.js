@@ -118,9 +118,10 @@ async function main() {
   receiver.speaking.on("start", (userId) => {
     if (activeSubscriptions.has(userId)) return;
     activeSubscriptions.add(userId);
+    discordQueues.set(userId, []);
 
     const opusStream = receiver.subscribe(userId, {
-      end: { behavior: EndBehaviorType.AfterSilence, duration: 500 },
+      end: { behavior: EndBehaviorType.Manual },
     });
 
     const decoder = new prism.opus.Decoder({
@@ -140,11 +141,6 @@ async function main() {
 
     decoder.on("error", () => {});
     opusStream.on("error", () => {});
-    opusStream.on("end", () => {
-      activeSubscriptions.delete(userId);
-      discordQueues.delete(userId);
-      decoder.destroy();
-    });
   });
 
   const discordPlayer = createAudioPlayer();
