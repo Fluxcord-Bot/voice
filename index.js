@@ -73,6 +73,8 @@ const SAMPLE_RATE = 48_000;
 const CHANNELS = 2;
 const FRAME_SIZE = 960; // samples per channel per 20ms frame
 const FRAME_SAMPLES = FRAME_SIZE * CHANNELS;
+// Cap queues at ~200ms to prevent unbounded growth during long bursts
+const MAX_QUEUE_DEPTH = 10;
 
 /** @param {Int16Array[]} frames */
 function mixFrames(frames) {
@@ -110,16 +112,15 @@ async function main() {
   const receiver = discordConnection.receiver;
   const activeSubscriptions = new Set();
 
-  /** @type {Map<string, Int16Array>} */
-  const discordFrames = new Map();
-  let newDiscordFrame = false;
+  /** @type {Map<string, Int16Array[]>} */
+  const discordQueues = new Map();
 
   receiver.speaking.on("start", (userId) => {
     if (activeSubscriptions.has(userId)) return;
     activeSubscriptions.add(userId);
 
     const opusStream = receiver.subscribe(userId, {
-      end: { behavior: EndBehaviorType.AfterSilence, duration: 200 },
+      end: { behavior: EndBehaviorType.AfterSilence, duration: 500 },
     });
 
     const decoder = new prism.opus.Decoder({
@@ -131,15 +132,17 @@ async function main() {
     opusStream.pipe(decoder);
 
     decoder.on("data", (/** @type {Buffer} */ pcm) => {
-      discordFrames.set(userId, new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2));
-      newDiscordFrame = true;
+      const frame = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
+      const queue = discordQueues.get(userId) ?? [];
+      if (queue.length < MAX_QUEUE_DEPTH) queue.push(frame);
+      discordQueues.set(userId, queue);
     });
 
     decoder.on("error", () => {});
     opusStream.on("error", () => {});
     opusStream.on("end", () => {
       activeSubscriptions.delete(userId);
-      discordFrames.delete(userId);
+      discordQueues.delete(userId);
       decoder.destroy();
     });
   });
@@ -162,21 +165,34 @@ async function main() {
 
   /** @type {Map<string, ReadableStreamDefaultReader>} */
   const audioReaders = new Map();
-  /** @type {Map<string, Int16Array>} */
-  const fluxerFrames = new Map();
+  /** @type {Map<string, Int16Array[]>} */
+  const fluxerQueues = new Map();
   /** @type {Map<string, Int16Array>} */
   const fluxerAccum = new Map();
-  let newFluxerFrame = false;
+  let lkReady = false;
+
+  const SILENCE = new Int16Array(FRAME_SAMPLES);
 
   setInterval(() => {
-    if (newDiscordFrame && discordFrames.size > 0) {
-      newDiscordFrame = false;
-      const mixed = mixFrames([...discordFrames.values()]);
+    // Discord → Livekit
+    if (lkReady) {
+      const dFrames = [];
+      for (const [, queue] of discordQueues) {
+        const frame = queue.shift();
+        if (frame) dFrames.push(frame);
+      }
+      const mixed = dFrames.length > 0 ? mixFrames(dFrames) : SILENCE;
       lkSource.captureFrame(new AudioFrame(mixed, SAMPLE_RATE, CHANNELS, FRAME_SIZE)).catch(() => {});
     }
-    if (newFluxerFrame && fluxerFrames.size > 0) {
-      newFluxerFrame = false;
-      const mixed = mixFrames([...fluxerFrames.values()]);
+
+    // Livekit → Discord
+    const fFrames = [];
+    for (const [, queue] of fluxerQueues) {
+      const frame = queue.shift();
+      if (frame) fFrames.push(frame);
+    }
+    if (fFrames.length > 0) {
+      const mixed = mixFrames(fFrames);
       const buf = Buffer.from(mixed.buffer, mixed.byteOffset, mixed.byteLength);
       if (!pcmPassthrough.writableEnded) pcmPassthrough.write(buf);
     }
@@ -190,6 +206,7 @@ async function main() {
     const reader = audioStream.getReader();
     audioReaders.set(track.sid, reader);
     fluxerAccum.set(track.sid, new Int16Array(0));
+    fluxerQueues.set(track.sid, []);
     const sid = track.sid;
     (async () => {
       try {
@@ -202,14 +219,16 @@ async function main() {
           combined.set(prev);
           combined.set(incoming, prev.length);
           while (combined.length >= FRAME_SAMPLES) {
-            fluxerFrames.set(sid, combined.slice(0, FRAME_SAMPLES));
-            newFluxerFrame = true;
+            const queue = fluxerQueues.get(sid);
+            if (queue && queue.length < MAX_QUEUE_DEPTH) {
+              queue.push(combined.slice(0, FRAME_SAMPLES));
+            }
             combined = combined.slice(FRAME_SAMPLES);
           }
           fluxerAccum.set(sid, combined);
         }
       } catch {}
-      fluxerFrames.delete(sid);
+      fluxerQueues.delete(sid);
       fluxerAccum.delete(sid);
     })();
   });
@@ -221,7 +240,7 @@ async function main() {
       reader.cancel();
       audioReaders.delete(track.sid);
     }
-    fluxerFrames.delete(track.sid);
+    fluxerQueues.delete(track.sid);
     fluxerAccum.delete(track.sid);
   });
 
@@ -230,6 +249,7 @@ async function main() {
   await room.connect(LIVEKIT_URL, LIVEKIT_TOKEN, { autoSubscribe: true });
   // @ts-ignore
   await room.localParticipant?.publishTrack(lkTrack, { source: TrackSource.SOURCE_MICROPHONE });
+  lkReady = true;
   log("Fluxer connected");
 
   let shuttingDown = false;
