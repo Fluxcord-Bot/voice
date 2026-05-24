@@ -60,6 +60,10 @@ function connect() {
   });
 
   ws.on("close", () => {
+    for (const [channelId, proc] of procs) {
+      try { proc.kill("SIGTERM"); } catch {}
+      procs.delete(channelId);
+    }
     log("Disconnected from core, reconnecting in 5s");
     setTimeout(connect, 5000);
   });

@@ -105,6 +105,26 @@ async function main() {
   await entersState(discordConnection, VoiceConnectionStatus.Ready, 30_000);
   log("Discord voice connected");
 
+  let reconnectingDiscordVoice = false;
+  discordConnection.on("stateChange", async (_oldState, newState) => {
+    if (newState.status !== VoiceConnectionStatus.Disconnected || reconnectingDiscordVoice) return;
+    reconnectingDiscordVoice = true;
+    try {
+      const rejoinAccepted = discordConnection.rejoin();
+      if (!rejoinAccepted) {
+        throw new Error("Voice connection rejected rejoin");
+      }
+      await entersState(discordConnection, VoiceConnectionStatus.Ready, 15_000);
+      log("Discord voice rejoined");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`Discord voice rejoin failed: ${message}`);
+      process.exit(2);
+    } finally {
+      reconnectingDiscordVoice = false;
+    }
+  });
+
   const room = new Room();
   const lkSource = new AudioSource(SAMPLE_RATE, CHANNELS);
   const lkTrack = LocalAudioTrack.createAudioTrack("discord-audio", lkSource);
