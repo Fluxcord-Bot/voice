@@ -73,8 +73,97 @@ const SAMPLE_RATE = 48_000;
 const CHANNELS = 2;
 const FRAME_SIZE = 960; // samples per channel per 20ms frame
 const FRAME_SAMPLES = FRAME_SIZE * CHANNELS;
-// Cap queues at ~200ms to prevent unbounded growth during long bursts
-const MAX_QUEUE_DEPTH = 10;
+const FRAME_DURATION_MS = 20;
+const MIN_BUFFER_DELAY = 2;
+const STARTUP_BUFFER_DELAY = 3;
+const MAX_BUFFER_DELAY = 8;
+// Cap queues at ~240ms to prevent unbounded growth during long bursts.
+const MAX_BUFFER_DEPTH = 12;
+
+/**
+ * @param {number} value
+ * @param {number} min
+ * @param {number} max
+ * @returns {number}
+ */
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+class JitterBuffer {
+  /**
+   * @param {Int16Array} silenceFrame
+   */
+  constructor(silenceFrame) {
+    /** @type {Int16Array[]} */
+    this.queue = [];
+    this.silenceFrame = silenceFrame;
+    this.started = false;
+    this.targetDelay = STARTUP_BUFFER_DELAY;
+    this.lastArrivalAt = 0;
+    this.jitterMs = 0;
+    this.stableTicks = 0;
+  }
+
+  /**
+   * @param {Int16Array} frame
+   */
+  push(frame) {
+    const now = Date.now();
+    if (this.lastArrivalAt !== 0) {
+      const deviation = Math.abs((now - this.lastArrivalAt) - FRAME_DURATION_MS);
+      this.jitterMs = this.jitterMs === 0 ? deviation : (this.jitterMs * 0.8) + (deviation * 0.2);
+      const adaptiveDelay = clamp(
+        STARTUP_BUFFER_DELAY + Math.ceil(this.jitterMs / FRAME_DURATION_MS),
+        MIN_BUFFER_DELAY,
+        MAX_BUFFER_DELAY,
+      );
+      if (adaptiveDelay > this.targetDelay) {
+        this.targetDelay = adaptiveDelay;
+        this.stableTicks = 0;
+      }
+    }
+    this.lastArrivalAt = now;
+
+    if (this.queue.length >= MAX_BUFFER_DEPTH) {
+      this.queue.shift();
+      this.started = true;
+      this.targetDelay = Math.min(MAX_BUFFER_DELAY, this.targetDelay + 1);
+      this.stableTicks = 0;
+    }
+
+    this.queue.push(frame);
+  }
+
+  /**
+   * @returns {Int16Array | null}
+   */
+  pull() {
+    if (!this.started) {
+      if (this.queue.length < this.targetDelay) return null;
+      this.started = true;
+    }
+
+    const frame = this.queue.shift();
+    if (frame) {
+      if (this.queue.length > this.targetDelay) {
+        this.stableTicks += 1;
+        if (this.stableTicks >= 50 && this.targetDelay > MIN_BUFFER_DELAY) {
+          this.targetDelay -= 1;
+          this.stableTicks = 0;
+        }
+      } else {
+        this.stableTicks = 0;
+      }
+      return frame;
+    }
+
+    this.started = false;
+    this.stableTicks = 0;
+    this.targetDelay = Math.min(MAX_BUFFER_DELAY, this.targetDelay + 1);
+    return this.silenceFrame;
+  }
+}
 
 /** @param {Int16Array[]} frames */
 function mixFrames(frames) {
@@ -133,9 +222,10 @@ async function main() {
   const activeSubscriptions = new Set();
   /** @type {Map<string, { opusStream: import("@discordjs/voice").AudioReceiveStream, decoder: prism.opus.Decoder, cleanedUp: boolean }>} */
   const subscriptionPipelines = new Map();
+  const SILENCE = new Int16Array(FRAME_SAMPLES);
 
-  /** @type {Map<string, Int16Array[]>} */
-  const discordQueues = new Map();
+  /** @type {Map<string, JitterBuffer>} */
+  const discordBuffers = new Map();
 
   /** @param {string} userId */
   function cleanupDiscordSubscription(userId) {
@@ -149,13 +239,13 @@ async function main() {
       pipeline.decoder.destroy();
     }
     activeSubscriptions.delete(userId);
-    discordQueues.delete(userId);
+    discordBuffers.delete(userId);
   }
 
   receiver.speaking.on("start", (userId) => {
     if (activeSubscriptions.has(userId)) return;
     activeSubscriptions.add(userId);
-    discordQueues.set(userId, []);
+    discordBuffers.set(userId, new JitterBuffer(SILENCE));
 
     const opusStream = receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.Manual },
@@ -171,10 +261,10 @@ async function main() {
     opusStream.pipe(decoder);
 
     decoder.on("data", (/** @type {Buffer} */ pcm) => {
-      const queue = discordQueues.get(userId);
-      if (!queue) return;
+      const buffer = discordBuffers.get(userId);
+      if (!buffer) return;
       const frame = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
-      if (queue.length < MAX_QUEUE_DEPTH) queue.push(frame);
+      buffer.push(frame);
     });
 
     const cleanup = () => cleanupDiscordSubscription(userId);
@@ -208,20 +298,18 @@ async function main() {
 
   /** @type {Map<string, ReadableStreamDefaultReader>} */
   const audioReaders = new Map();
-  /** @type {Map<string, Int16Array[]>} */
-  const fluxerQueues = new Map();
+  /** @type {Map<string, JitterBuffer>} */
+  const fluxerBuffers = new Map();
   /** @type {Map<string, Int16Array>} */
   const fluxerAccum = new Map();
   let lkReady = false;
-
-  const SILENCE = new Int16Array(FRAME_SAMPLES);
 
   const mixInterval = setInterval(() => {
     // Discord → Livekit
     if (lkReady) {
       const dFrames = [];
-      for (const [, queue] of discordQueues) {
-        const frame = queue.shift();
+      for (const [, buffer] of discordBuffers) {
+        const frame = buffer.pull();
         if (frame) dFrames.push(frame);
       }
       const mixed = dFrames.length > 0 ? mixFrames(dFrames) : SILENCE;
@@ -230,16 +318,14 @@ async function main() {
 
     // Livekit → Discord
     const fFrames = [];
-    for (const [, queue] of fluxerQueues) {
-      const frame = queue.shift();
+    for (const [, buffer] of fluxerBuffers) {
+      const frame = buffer.pull();
       if (frame) fFrames.push(frame);
     }
-    if (fFrames.length > 0) {
-      const mixed = mixFrames(fFrames);
-      const buf = Buffer.from(mixed.buffer, mixed.byteOffset, mixed.byteLength);
-      if (!pcmPassthrough.writableEnded) pcmPassthrough.write(buf);
-    }
-  }, 20);
+    const mixed = fFrames.length > 0 ? mixFrames(fFrames) : SILENCE;
+    const buf = Buffer.from(mixed.buffer, mixed.byteOffset, mixed.byteLength);
+    if (!pcmPassthrough.writableEnded) pcmPassthrough.write(buf);
+  }, FRAME_DURATION_MS);
 
   room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
     if (track.kind !== TrackKind.KIND_AUDIO) return;
@@ -249,7 +335,7 @@ async function main() {
     const reader = audioStream.getReader();
     audioReaders.set(track.sid, reader);
     fluxerAccum.set(track.sid, new Int16Array(0));
-    fluxerQueues.set(track.sid, []);
+    fluxerBuffers.set(track.sid, new JitterBuffer(SILENCE));
     const sid = track.sid;
     (async () => {
       try {
@@ -262,16 +348,16 @@ async function main() {
           combined.set(prev);
           combined.set(incoming, prev.length);
           while (combined.length >= FRAME_SAMPLES) {
-            const queue = fluxerQueues.get(sid);
-            if (queue && queue.length < MAX_QUEUE_DEPTH) {
-              queue.push(combined.slice(0, FRAME_SAMPLES));
+            const buffer = fluxerBuffers.get(sid);
+            if (buffer) {
+              buffer.push(combined.slice(0, FRAME_SAMPLES));
             }
             combined = combined.slice(FRAME_SAMPLES);
           }
           fluxerAccum.set(sid, combined);
         }
       } catch {}
-      fluxerQueues.delete(sid);
+      fluxerBuffers.delete(sid);
       fluxerAccum.delete(sid);
     })();
   });
@@ -283,7 +369,7 @@ async function main() {
       reader.cancel();
       audioReaders.delete(track.sid);
     }
-    fluxerQueues.delete(track.sid);
+    fluxerBuffers.delete(track.sid);
     fluxerAccum.delete(track.sid);
   });
 
