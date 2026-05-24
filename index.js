@@ -111,9 +111,26 @@ async function main() {
 
   const receiver = discordConnection.receiver;
   const activeSubscriptions = new Set();
+  /** @type {Map<string, { opusStream: import("@discordjs/voice").AudioReceiveStream, decoder: prism.opus.Decoder, cleanedUp: boolean }>} */
+  const subscriptionPipelines = new Map();
 
   /** @type {Map<string, Int16Array[]>} */
   const discordQueues = new Map();
+
+  /** @param {string} userId */
+  function cleanupDiscordSubscription(userId) {
+    const pipeline = subscriptionPipelines.get(userId);
+    if (pipeline) {
+      if (pipeline.cleanedUp) return;
+      pipeline.cleanedUp = true;
+      subscriptionPipelines.delete(userId);
+      pipeline.opusStream.unpipe(pipeline.decoder);
+      pipeline.opusStream.destroy();
+      pipeline.decoder.destroy();
+    }
+    activeSubscriptions.delete(userId);
+    discordQueues.delete(userId);
+  }
 
   receiver.speaking.on("start", (userId) => {
     if (activeSubscriptions.has(userId)) return;
@@ -129,18 +146,28 @@ async function main() {
       channels: CHANNELS,
       frameSize: FRAME_SIZE,
     });
+    subscriptionPipelines.set(userId, { opusStream, decoder, cleanedUp: false });
 
     opusStream.pipe(decoder);
 
     decoder.on("data", (/** @type {Buffer} */ pcm) => {
+      const queue = discordQueues.get(userId);
+      if (!queue) return;
       const frame = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
-      const queue = discordQueues.get(userId) ?? [];
       if (queue.length < MAX_QUEUE_DEPTH) queue.push(frame);
-      discordQueues.set(userId, queue);
     });
 
-    decoder.on("error", () => {});
-    opusStream.on("error", () => {});
+    const cleanup = () => cleanupDiscordSubscription(userId);
+
+    decoder.once("close", cleanup);
+    decoder.once("error", cleanup);
+    opusStream.once("close", cleanup);
+    opusStream.once("end", cleanup);
+    opusStream.once("error", cleanup);
+  });
+
+  receiver.speaking.on("end", (userId) => {
+    cleanupDiscordSubscription(userId);
   });
 
   const discordPlayer = createAudioPlayer();
@@ -169,7 +196,7 @@ async function main() {
 
   const SILENCE = new Int16Array(FRAME_SAMPLES);
 
-  setInterval(() => {
+  const mixInterval = setInterval(() => {
     // Discord → Livekit
     if (lkReady) {
       const dFrames = [];
@@ -253,6 +280,10 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     log("Shutting down");
+    clearInterval(mixInterval);
+    for (const userId of [...activeSubscriptions]) {
+      cleanupDiscordSubscription(userId);
+    }
     discordConnection.destroy();
     await room.disconnect();
     process.exit(0);
