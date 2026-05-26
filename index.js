@@ -19,6 +19,7 @@ import {
   TrackSource,
   AudioFrame,
 } from "@livekit/rtc-node";
+import DiscordOpus from "@discordjs/opus";
 import prism from "prism-media";
 import { PassThrough } from "node:stream";
 
@@ -88,6 +89,20 @@ const MAX_BUFFER_DEPTH = 12;
  */
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function assertNativeOpusAvailable() {
+  const { OpusEncoder } = DiscordOpus;
+  if (typeof OpusEncoder !== "function") {
+    throw new Error("Native @discordjs/opus bindings are unavailable");
+  }
+
+  const encoder = new OpusEncoder(SAMPLE_RATE, CHANNELS);
+  if (!encoder) {
+    throw new Error("Native @discordjs/opus encoder initialization failed");
+  }
+
+  log("Using native @discordjs/opus codec");
 }
 
 class JitterBuffer {
@@ -177,6 +192,8 @@ function mixFrames(frames) {
 }
 
 async function main() {
+  assertNativeOpusAvailable();
+
   const discordConnection = joinVoiceChannel({
     channelId: DISCORD_CHANNEL_ID,
     guildId: DISCORD_GUILD_ID,
