@@ -75,11 +75,12 @@ const CHANNELS = 2;
 const FRAME_SIZE = 960; // samples per channel per 20ms frame
 const FRAME_SAMPLES = FRAME_SIZE * CHANNELS;
 const FRAME_DURATION_MS = 20;
-const MIN_BUFFER_DELAY = 2;
-const STARTUP_BUFFER_DELAY = 3;
+const MIN_BUFFER_DELAY = 3;
+const STARTUP_BUFFER_DELAY = 4;
 const MAX_BUFFER_DELAY = 8;
 // Cap queues at ~240ms to prevent unbounded growth during long bursts.
 const MAX_BUFFER_DEPTH = 12;
+const MAX_CONCEALMENT_FRAMES = 1;
 
 /**
  * @param {number} value
@@ -113,11 +114,13 @@ class JitterBuffer {
     /** @type {Int16Array[]} */
     this.queue = [];
     this.silenceFrame = silenceFrame;
+    this.lastFrame = silenceFrame;
     this.started = false;
     this.targetDelay = STARTUP_BUFFER_DELAY;
     this.lastArrivalAt = 0;
     this.jitterMs = 0;
     this.stableTicks = 0;
+    this.concealmentFrames = 0;
   }
 
   /**
@@ -148,6 +151,7 @@ class JitterBuffer {
     }
 
     this.queue.push(frame);
+    this.concealmentFrames = 0;
   }
 
   /**
@@ -170,14 +174,39 @@ class JitterBuffer {
       } else {
         this.stableTicks = 0;
       }
+      this.lastFrame = frame;
+      this.concealmentFrames = 0;
       return frame;
+    }
+
+    if (this.concealmentFrames < MAX_CONCEALMENT_FRAMES) {
+      this.concealmentFrames += 1;
+      return concealFrame(this.lastFrame, this.silenceFrame, this.concealmentFrames);
     }
 
     this.started = false;
     this.stableTicks = 0;
+    this.concealmentFrames = 0;
     this.targetDelay = Math.min(MAX_BUFFER_DELAY, this.targetDelay + 1);
     return this.silenceFrame;
   }
+}
+
+/**
+ * Fade the last frame a bit instead of cutting straight to silence.
+ * @param {Int16Array} frame
+ * @param {Int16Array} silenceFrame
+ * @param {number} concealmentFrames
+ * @returns {Int16Array}
+ */
+function concealFrame(frame, silenceFrame, concealmentFrames) {
+  if (frame === silenceFrame) return silenceFrame;
+  const gain = concealmentFrames === 1 ? 0.35 : 0.15;
+  const concealed = new Int16Array(frame.length);
+  for (let i = 0; i < frame.length; i++) {
+    concealed[i] = Math.trunc(frame[i] * gain);
+  }
+  return concealed;
 }
 
 /** @param {Int16Array[]} frames */
@@ -245,25 +274,12 @@ async function main() {
   const discordBuffers = new Map();
 
   /** @param {string} userId */
-  function cleanupDiscordSubscription(userId) {
-    const pipeline = subscriptionPipelines.get(userId);
-    if (pipeline) {
-      if (pipeline.cleanedUp) return;
-      pipeline.cleanedUp = true;
-      subscriptionPipelines.delete(userId);
-      pipeline.opusStream.unpipe(pipeline.decoder);
-      pipeline.opusStream.destroy();
-      pipeline.decoder.destroy();
-    }
-    activeSubscriptions.delete(userId);
-    discordBuffers.delete(userId);
-  }
-
-  receiver.speaking.on("start", (userId) => {
-    if (activeSubscriptions.has(userId)) return;
+  function ensureDiscordSubscription(userId) {
+    if (!userId || userId === DISCORD_USER_ID || activeSubscriptions.has(userId)) return;
     activeSubscriptions.add(userId);
     discordBuffers.set(userId, new JitterBuffer(SILENCE));
 
+    log(`Subscribed to Discord audio: ${userId}`);
     const opusStream = receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.Manual },
     });
@@ -280,7 +296,8 @@ async function main() {
     decoder.on("data", (/** @type {Buffer} */ pcm) => {
       const buffer = discordBuffers.get(userId);
       if (!buffer) return;
-      const frame = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
+      // Copy the PCM frame before queuing it so reused buffer memory doesn't cause these weird FUCKING CHIRPS
+      const frame = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2).slice();
       buffer.push(frame);
     });
 
@@ -291,6 +308,31 @@ async function main() {
     opusStream.once("close", cleanup);
     opusStream.once("end", cleanup);
     opusStream.once("error", cleanup);
+  }
+
+  function hydrateDiscordSpeakingUsers() {
+    for (const userId of receiver.speaking.users.keys()) {
+      ensureDiscordSubscription(userId);
+    }
+  }
+
+  /** @param {string} userId */
+  function cleanupDiscordSubscription(userId) {
+    const pipeline = subscriptionPipelines.get(userId);
+    if (pipeline) {
+      if (pipeline.cleanedUp) return;
+      pipeline.cleanedUp = true;
+      subscriptionPipelines.delete(userId);
+      pipeline.opusStream.unpipe(pipeline.decoder);
+      pipeline.opusStream.destroy();
+      pipeline.decoder.destroy();
+    }
+    activeSubscriptions.delete(userId);
+    discordBuffers.delete(userId);
+  }
+
+  receiver.speaking.on("start", (userId) => {
+    ensureDiscordSubscription(userId);
   });
 
   receiver.speaking.on("end", (userId) => {
@@ -321,33 +363,15 @@ async function main() {
   const fluxerAccum = new Map();
   let lkReady = false;
 
-  const mixInterval = setInterval(() => {
-    // Discord → Livekit
-    if (lkReady) {
-      const dFrames = [];
-      for (const [, buffer] of discordBuffers) {
-        const frame = buffer.pull();
-        if (frame) dFrames.push(frame);
-      }
-      const mixed = dFrames.length > 0 ? mixFrames(dFrames) : SILENCE;
-      lkSource.captureFrame(new AudioFrame(mixed, SAMPLE_RATE, CHANNELS, FRAME_SIZE)).catch(() => {});
-    }
-
-    // Livekit → Discord
-    const fFrames = [];
-    for (const [, buffer] of fluxerBuffers) {
-      const frame = buffer.pull();
-      if (frame) fFrames.push(frame);
-    }
-    const mixed = fFrames.length > 0 ? mixFrames(fFrames) : SILENCE;
-    const buf = Buffer.from(mixed.buffer, mixed.byteOffset, mixed.byteLength);
-    if (!pcmPassthrough.writableEnded) pcmPassthrough.write(buf);
-  }, FRAME_DURATION_MS);
-
-  room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
+  /**
+   * @param {import("@livekit/rtc-node").RemoteTrack} track
+   * @param {import("@livekit/rtc-node").RemoteParticipant} participant
+   * @param {string} source
+   */
+  function attachFluxerAudioTrack(track, participant, source) {
     if (track.kind !== TrackKind.KIND_AUDIO) return;
-    if (!track.sid) return;
-    log(`Subscribed to audio: ${participant.identity}`);
+    if (!track.sid || audioReaders.has(track.sid)) return;
+    log(`Subscribed to audio: ${participant.identity} (${source})`);
     const audioStream = new AudioStream(track, SAMPLE_RATE, CHANNELS);
     const reader = audioStream.getReader();
     audioReaders.set(track.sid, reader);
@@ -376,7 +400,65 @@ async function main() {
       } catch {}
       fluxerBuffers.delete(sid);
       fluxerAccum.delete(sid);
+      audioReaders.delete(sid);
     })();
+  }
+
+  /**
+   * Pick up remote audio that's already there after reconnect (also connect).
+   * @param {string} reason
+   */
+  function hydrateFluxerAudioTracks(reason) {
+    for (const participant of room.remoteParticipants.values()) {
+      for (const publication of participant.trackPublications.values()) {
+        if (publication.kind !== TrackKind.KIND_AUDIO) continue;
+        if (!publication.subscribed) {
+          publication.setSubscribed(true);
+          log(`Requested audio subscription for ${participant.identity} (${reason})`);
+        }
+        if (publication.track) {
+          attachFluxerAudioTrack(publication.track, participant, reason);
+        }
+      }
+    }
+  }
+
+  /** @type {NodeJS.Timeout | null} */
+  let mixTimer = null;
+  let nextMixAt = Date.now() + FRAME_DURATION_MS;
+  const discordSpeakingSweep = setInterval(hydrateDiscordSpeakingUsers, 250);
+
+  const mixTick = () => {
+    // Discord → Livekit
+    if (lkReady) {
+      const dFrames = [];
+      for (const [, buffer] of discordBuffers) {
+        const frame = buffer.pull();
+        if (frame) dFrames.push(frame);
+      }
+      const mixed = dFrames.length > 0 ? mixFrames(dFrames) : SILENCE;
+      lkSource.captureFrame(new AudioFrame(mixed, SAMPLE_RATE, CHANNELS, FRAME_SIZE)).catch(() => {});
+    }
+
+    // Livekit → Discord
+    const fFrames = [];
+    for (const [, buffer] of fluxerBuffers) {
+      const frame = buffer.pull();
+      if (frame) fFrames.push(frame);
+    }
+    const mixed = fFrames.length > 0 ? mixFrames(fFrames) : SILENCE;
+    const buf = Buffer.from(mixed.buffer, mixed.byteOffset, mixed.byteLength);
+    if (!pcmPassthrough.writableEnded) pcmPassthrough.write(buf);
+
+    nextMixAt += FRAME_DURATION_MS;
+    const delay = Math.max(0, nextMixAt - Date.now());
+    mixTimer = setTimeout(mixTick, delay);
+  };
+
+  mixTimer = setTimeout(mixTick, FRAME_DURATION_MS);
+
+  room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
+    attachFluxerAudioTrack(track, participant, "track event");
   });
 
   room.on(RoomEvent.TrackUnsubscribed, (track) => {
@@ -393,6 +475,10 @@ async function main() {
   log(`Connecting to Fluxer at ${LIVEKIT_URL}`);
   // @ts-ignore
   await room.connect(LIVEKIT_URL, LIVEKIT_TOKEN, { autoSubscribe: true });
+  hydrateFluxerAudioTracks("initial connect");
+  room.on(RoomEvent.Reconnected, () => {
+    hydrateFluxerAudioTracks("reconnect");
+  });
   // @ts-ignore
   await room.localParticipant?.publishTrack(lkTrack, { source: TrackSource.SOURCE_MICROPHONE });
   lkReady = true;
@@ -403,7 +489,8 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     log("Shutting down");
-    clearInterval(mixInterval);
+    if (mixTimer) clearTimeout(mixTimer);
+    clearInterval(discordSpeakingSweep);
     for (const userId of [...activeSubscriptions]) {
       cleanupDiscordSubscription(userId);
     }
