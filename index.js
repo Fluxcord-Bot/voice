@@ -16,6 +16,7 @@ import {
   LocalAudioTrack,
   AudioStream,
   TrackKind,
+  TrackPublishOptions,
   TrackSource,
   AudioFrame,
 } from "@livekit/rtc-node";
@@ -27,6 +28,25 @@ import { PassThrough } from "node:stream";
 function log(msg) {
   const time = new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   console.log(`[${time} VOICE] ${msg}`);
+}
+
+/** @param {unknown} error */
+function formatError(error) {
+  if (error instanceof AggregateError) {
+    const parts = [];
+    for (const inner of error.errors ?? []) {
+      if (inner instanceof Error) {
+        parts.push(inner.stack ?? inner.message);
+      } else {
+        parts.push(String(inner));
+      }
+    }
+    return `AggregateError\n${parts.join("\n---\n")}`;
+  }
+  if (error instanceof Error) {
+    return error.stack ?? error.message;
+  }
+  return String(error);
 }
 
 const {
@@ -75,6 +95,7 @@ const CHANNELS = 2;
 const FRAME_SIZE = 960; // samples per channel per 20ms frame
 const FRAME_SAMPLES = FRAME_SIZE * CHANNELS;
 const FRAME_DURATION_MS = 20;
+const RECONNECT_TIMEOUT_MS = 15_000;
 const MIN_BUFFER_DELAY = 3;
 const STARTUP_BUFFER_DELAY = 4;
 const MAX_BUFFER_DELAY = 8;
@@ -104,6 +125,12 @@ function assertNativeOpusAvailable() {
   }
 
   log("Using native @discordjs/opus codec");
+}
+
+function createMicrophonePublishOptions() {
+  const options = new TrackPublishOptions();
+  options.source = TrackSource.SOURCE_MICROPHONE;
+  return options;
 }
 
 class JitterBuffer {
@@ -241,10 +268,33 @@ async function main() {
   log("Discord voice connected");
 
   let reconnectingDiscordVoice = false;
-  discordConnection.on("stateChange", async (_oldState, newState) => {
+  /** @type {NodeJS.Timeout | null} */
+  let discordRecoveryTimer = null;
+  discordConnection.on("stateChange", async (oldState, newState) => {
+    if (oldState.status !== newState.status) {
+      log(`Discord voice state ${oldState.status} -> ${newState.status}`);
+    }
+    if (newState.status === VoiceConnectionStatus.Ready) {
+      if (discordRecoveryTimer) {
+        clearTimeout(discordRecoveryTimer);
+        discordRecoveryTimer = null;
+      }
+    } else if (
+      newState.status === VoiceConnectionStatus.Connecting ||
+      newState.status === VoiceConnectionStatus.Signalling ||
+      newState.status === VoiceConnectionStatus.Disconnected
+    ) {
+      if (!discordRecoveryTimer) {
+        discordRecoveryTimer = setTimeout(() => {
+          log("Discord voice did not recover in time, restarting bridge");
+          process.exit(4);
+        }, RECONNECT_TIMEOUT_MS);
+      }
+    }
     if (newState.status !== VoiceConnectionStatus.Disconnected || reconnectingDiscordVoice) return;
     reconnectingDiscordVoice = true;
     try {
+      log("Discord voice disconnected, attempting in-process rejoin");
       const rejoinAccepted = discordConnection.rejoin();
       if (!rejoinAccepted) {
         throw new Error("Voice connection rejected rejoin");
@@ -263,6 +313,8 @@ async function main() {
   const room = new Room();
   const lkSource = new AudioSource(SAMPLE_RATE, CHANNELS);
   const lkTrack = LocalAudioTrack.createAudioTrack("discord-audio", lkSource);
+  let livekitConnected = false;
+  let livekitTrackPublished = false;
 
   const receiver = discordConnection.receiver;
   const activeSubscriptions = new Set();
@@ -362,6 +414,45 @@ async function main() {
   /** @type {Map<string, Int16Array>} */
   const fluxerAccum = new Map();
   let lkReady = false;
+  let reconnectingFluxerRoom = false;
+
+  function resetFluxerRemoteAudioState() {
+    for (const [, reader] of audioReaders) {
+      try {
+        void reader.cancel();
+      } catch {}
+    }
+    audioReaders.clear();
+    fluxerBuffers.clear();
+    fluxerAccum.clear();
+  }
+
+  /** @param {string} reason */
+  async function ensureFluxerTrackPublished(reason) {
+    const participant = room.localParticipant;
+    if (!participant) {
+      lkReady = false;
+      log(`Can't publish Discord audio to Fluxer yet (${reason})`);
+      return false;
+    }
+    if (livekitTrackPublished) {
+      lkReady = true;
+      log(`Discord audio already published (${reason})`);
+      return true;
+    }
+    try {
+      await participant.publishTrack(lkTrack, createMicrophonePublishOptions());
+      livekitTrackPublished = true;
+      lkReady = true;
+      log(`Published Discord audio to Fluxer (${reason})`);
+      return true;
+    } catch (error) {
+      lkReady = false;
+      const message = error instanceof Error ? error.message : String(error);
+      log(`Couldn't publish Discord audio to Fluxer (${reason}): ${message}`);
+      return false;
+    }
+  }
 
   /**
    * @param {import("@livekit/rtc-node").RemoteTrack} track
@@ -404,10 +495,7 @@ async function main() {
     })();
   }
 
-  /**
-   * Pick up remote audio that's already there after reconnect (also connect).
-   * @param {string} reason
-   */
+  /** @param {string} reason */
   function hydrateFluxerAudioTracks(reason) {
     for (const participant of room.remoteParticipants.values()) {
       for (const publication of participant.trackPublications.values()) {
@@ -425,6 +513,9 @@ async function main() {
 
   /** @type {NodeJS.Timeout | null} */
   let mixTimer = null;
+  /** @type {NodeJS.Timeout | null} */
+  let livekitRecoveryTimer = null;
+  let shuttingDown = false;
   let nextMixAt = Date.now() + FRAME_DURATION_MS;
   const discordSpeakingSweep = setInterval(hydrateDiscordSpeakingUsers, 250);
 
@@ -472,25 +563,108 @@ async function main() {
     fluxerAccum.delete(track.sid);
   });
 
+  room.on(RoomEvent.LocalTrackPublished, () => {
+    livekitTrackPublished = true;
+    log("Fluxer accepted the Discord audio track");
+  });
+
+  room.on(RoomEvent.LocalTrackUnpublished, () => {
+    livekitTrackPublished = false;
+    lkReady = false;
+    log("Fluxer unpublished the Discord audio track");
+  });
+
+  room.on(RoomEvent.Connected, () => {
+    livekitConnected = true;
+    log(
+      `Fluxer room connected (${room.remoteParticipants.size} remote participant${room.remoteParticipants.size === 1 ? "" : "s"})`,
+    );
+  });
+
+  room.on(RoomEvent.Reconnecting, () => {
+    livekitConnected = false;
+    livekitTrackPublished = false;
+    lkReady = false;
+    resetFluxerRemoteAudioState();
+    if (livekitRecoveryTimer) clearTimeout(livekitRecoveryTimer);
+    livekitRecoveryTimer = null;
+    log("Fluxer room reconnecting");
+  });
+
+  room.on(RoomEvent.Reconnected, async () => {
+    if (livekitRecoveryTimer) {
+      clearTimeout(livekitRecoveryTimer);
+      livekitRecoveryTimer = null;
+    }
+    livekitConnected = true;
+    log(
+      `Fluxer room reconnected (${room.remoteParticipants.size} remote participant${room.remoteParticipants.size === 1 ? "" : "s"})`,
+    );
+    hydrateFluxerAudioTracks("reconnect");
+    if (!(await ensureFluxerTrackPublished("reconnect"))) {
+      log("Failed to restore Discord audio track after LiveKit reconnect");
+    }
+  });
+
+  room.on(RoomEvent.Disconnected, /** @param {import("@livekit/rtc-node").DisconnectReason} reason */ (reason) => {
+    if (livekitRecoveryTimer) {
+      clearTimeout(livekitRecoveryTimer);
+      livekitRecoveryTimer = null;
+    }
+    livekitConnected = false;
+    livekitTrackPublished = false;
+    lkReady = false;
+    resetFluxerRemoteAudioState();
+    const detail = reason ? `: ${reason}` : "";
+    log(`Fluxer room disconnected${detail}`);
+    if (shuttingDown || reconnectingFluxerRoom) return;
+    reconnectingFluxerRoom = true;
+    void (async () => {
+      try {
+        log("Attempting in-process Fluxer room reconnect after hard disconnect");
+        // @ts-ignore
+        await room.connect(LIVEKIT_URL, LIVEKIT_TOKEN, { autoSubscribe: true });
+        hydrateFluxerAudioTracks("hard reconnect");
+        if (!(await ensureFluxerTrackPublished("hard reconnect"))) {
+          throw new Error("Failed to restore Discord audio track after hard Fluxer reconnect");
+        }
+        livekitConnected = true;
+        log(
+          `Fluxer room reconnected after hard disconnect (${room.remoteParticipants.size} remote participant${room.remoteParticipants.size === 1 ? "" : "s"})`,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        log(`Fluxer reconnect failed: ${message}`);
+        process.exit(6);
+      } finally {
+        reconnectingFluxerRoom = false;
+      }
+    })();
+  });
+
   log(`Connecting to Fluxer at ${LIVEKIT_URL}`);
   // @ts-ignore
   await room.connect(LIVEKIT_URL, LIVEKIT_TOKEN, { autoSubscribe: true });
   hydrateFluxerAudioTracks("initial connect");
-  room.on(RoomEvent.Reconnected, () => {
-    hydrateFluxerAudioTracks("reconnect");
-  });
-  // @ts-ignore
-  await room.localParticipant?.publishTrack(lkTrack, { source: TrackSource.SOURCE_MICROPHONE });
-  lkReady = true;
+  livekitConnected = true;
+  if (!(await ensureFluxerTrackPublished("initial connect"))) {
+    throw new Error("Failed to publish Discord audio track to Fluxer");
+  }
   log("Fluxer connected");
+  process.send?.("bridge-ready");
 
-  let shuttingDown = false;
+  /** @type {NodeJS.Timeout | null} */
+  let startupTimeout = null;
+
   async function shutdown() {
     if (shuttingDown) return;
     shuttingDown = true;
     log("Shutting down");
     if (mixTimer) clearTimeout(mixTimer);
+    if (livekitRecoveryTimer) clearTimeout(livekitRecoveryTimer);
+    if (discordRecoveryTimer) clearTimeout(discordRecoveryTimer);
     clearInterval(discordSpeakingSweep);
+    if (startupTimeout) clearTimeout(startupTimeout);
     for (const userId of [...activeSubscriptions]) {
       cleanupDiscordSubscription(userId);
     }
@@ -503,17 +677,23 @@ async function main() {
   process.on("SIGINT", shutdown);
 
   // If no Fluxer participants appear within 10s, signal the parent.
-  const startupTimeout = setTimeout(() => {
-    if (room.remoteParticipants.size === 0) process.send?.("fluxer-empty");
+  startupTimeout = setTimeout(() => {
+    if (livekitConnected && room.remoteParticipants.size === 0) process.send?.("fluxer-empty");
   }, 10_000);
 
   room.on(RoomEvent.ParticipantConnected, () => {
     clearTimeout(startupTimeout);
+    if (livekitConnected) {
+      log(`Fluxer participant count is now ${room.remoteParticipants.size}`);
+    }
     process.send?.("fluxer-joined");
   });
 
   room.on(RoomEvent.ParticipantDisconnected, () => {
-    if (room.remoteParticipants.size === 0) {
+    if (livekitConnected) {
+      log(`Fluxer participant count is now ${room.remoteParticipants.size}`);
+    }
+    if (livekitConnected && room.remoteParticipants.size === 0) {
       log("All Fluxer participants left");
       process.send?.("fluxer-empty");
     }
@@ -521,6 +701,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  log(`Fatal: ${e}`);
+  log(`Fatal: ${formatError(e)}`);
   process.exit(1);
 });

@@ -16,6 +16,23 @@ function log(msg) {
 
 /** @type {Map<string, import("child_process").ChildProcess>} */
 const procs = new Map();
+/** @type {WeakSet<import("child_process").ChildProcess>} */
+const suppressedExitProcs = new WeakSet();
+
+/**
+ * @param {string} channelId
+ * @param {string} reason
+ */
+function stopProc(channelId, reason) {
+  const proc = procs.get(channelId);
+  if (!proc) return;
+  log(`Stopping existing bridge for channel ${channelId} (${reason})`);
+  if (reason === "replaced by new spawn") {
+    suppressedExitProcs.add(proc);
+  }
+  try { proc.kill("SIGTERM"); } catch {}
+  procs.delete(channelId);
+}
 
 function connect() {
   log(`Connecting to ${CORE_WS_URL}`);
@@ -34,6 +51,7 @@ function connect() {
 
     if (msg.type === "spawn") {
       const { channelId, env } = msg;
+      stopProc(channelId, "replaced by new spawn");
       log(`Spawning bridge for channel ${channelId}`);
 
       const proc = spawn("node", [VOICE_SCRIPT], {
@@ -49,13 +67,18 @@ function connect() {
 
       proc.on("message", (ipcMsg) => send({ type: "message", channelId, msg: ipcMsg }));
       proc.on("error", (err) => send({ type: "error", channelId, message: err.message }));
-      proc.on("exit", (code) => { procs.delete(channelId); send({ type: "exit", channelId, code }); });
+      proc.on("exit", (code) => {
+        if (procs.get(channelId) === proc) {
+          procs.delete(channelId);
+        }
+        if (suppressedExitProcs.has(proc)) {
+          suppressedExitProcs.delete(proc);
+          return;
+        }
+        send({ type: "exit", channelId, code });
+      });
     } else if (msg.type === "kill") {
-      const proc = procs.get(msg.channelId);
-      if (proc) {
-        try { proc.kill("SIGTERM"); } catch {}
-        procs.delete(msg.channelId);
-      }
+      stopProc(msg.channelId, "kill requested by core");
     }
   });
 
