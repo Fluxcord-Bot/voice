@@ -457,10 +457,12 @@ async function main() {
   /**
    * @param {import("@livekit/rtc-node").RemoteTrack} track
    * @param {import("@livekit/rtc-node").RemoteParticipant} participant
-   * @param {string} source
+   * @param {import("@livekit/rtc-node").TrackSource} source
+   * @param {string} reason
    */
-  function attachFluxerAudioTrack(track, participant, source) {
+  function attachFluxerAudioTrack(track, participant, source, reason) {
     if (track.kind !== TrackKind.KIND_AUDIO) return;
+    if (source === TrackSource.SOURCE_SCREENSHARE_AUDIO || source === TrackSource.SOURCE_SCREENSHARE) return;
     if (!track.sid || audioReaders.has(track.sid)) return;
     log(`Subscribed to audio: ${participant.identity} (${source})`);
     const audioStream = new AudioStream(track, SAMPLE_RATE, CHANNELS);
@@ -505,7 +507,7 @@ async function main() {
           log(`Requested audio subscription for ${participant.identity} (${reason})`);
         }
         if (publication.track) {
-          attachFluxerAudioTrack(publication.track, participant, reason);
+          attachFluxerAudioTrack(publication.track, participant, publication.source ?? TrackSource.SOURCE_MICROPHONE, reason);
         }
       }
     }
@@ -548,8 +550,8 @@ async function main() {
 
   mixTimer = setTimeout(mixTick, FRAME_DURATION_MS);
 
-  room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
-    attachFluxerAudioTrack(track, participant, "track event");
+  room.on(RoomEvent.TrackSubscribed, (track, pub, participant) => {
+    attachFluxerAudioTrack(track, participant, pub.source ?? TrackSource.SOURCE_MICROPHONE, "track event");
   });
 
   room.on(RoomEvent.TrackUnsubscribed, (track) => {
