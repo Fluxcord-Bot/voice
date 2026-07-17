@@ -4,11 +4,11 @@
   "type": "module",
   "main": "index.js",
   "dependencies": {
+    "@discordjs/opus": "^0.10.0",
     "@discordjs/voice": "0.19.3-dev.1775045529-1f9affd97",
     "@fluxerjs/core": "latest",
     "@livekit/rtc-node": "latest",
     "@snazzah/davey": "latest",
-    "opusscript": "^0.0.8",
     "prism-media": "latest",
     "ws": "^8.20.0"
   }

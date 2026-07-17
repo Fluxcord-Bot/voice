@@ -1,0 +1,8 @@
+packages:
+  - .
+
+allowBuilds:
+  "@discordjs/opus": true
+
+overrides:
+  brace-expansion: 1.1.12
