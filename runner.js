@@ -1,4 +1,5 @@
 //@ts-check
+import http from "node:http";
 import { WebSocket } from "ws";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
@@ -34,11 +35,56 @@ function stopProc(channelId, reason) {
   procs.delete(channelId);
 }
 
+/** @type {import("ws").WebSocket | null} */
+let coreWs = null;
+
+function isCoreConnected() {
+  return !!coreWs && coreWs.readyState === WebSocket.OPEN;
+}
+
+const HEALTHCHECK_ENABLED = !["0", "false", "no", "off"].includes(
+  String(process.env.HEALTHCHECK_ENABLED ?? "1").toLowerCase(),
+);
+const HEALTHCHECK_PORT = Number(process.env.HEALTHCHECK_PORT ?? 8080) || 8080;
+const HEALTHCHECK_HOST = process.env.HEALTHCHECK_HOST ?? "0.0.0.0";
+
+if (HEALTHCHECK_ENABLED) {
+  const server = http.createServer((req, res) => {
+    const url = (req.url || "/").split("?")[0];
+
+    if (req.method !== "GET" || (url !== "/health" && url !== "/live" && url !== "/ready")) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "not_found" }));
+      return;
+    }
+
+    const connected = isCoreConnected();
+    const healthy = url === "/live" ? true : connected;
+
+    res.writeHead(healthy ? 200 : 503, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        status: healthy ? "ok" : "degraded",
+        core: connected ? "connected" : "disconnected",
+        bridges: procs.size,
+        uptime: Math.floor(process.uptime()),
+        timestamp: new Date().toISOString(),
+      }),
+    );
+  });
+
+  server.on("error", (err) => log(`Healthcheck failed on ${HEALTHCHECK_HOST}:${HEALTHCHECK_PORT}: ${err.message}`));
+  server.listen(HEALTHCHECK_PORT, HEALTHCHECK_HOST, () => {
+    log(`Healthcheck listening on ${HEALTHCHECK_HOST}:${HEALTHCHECK_PORT} (/health)`);
+  });
+}
+
 function connect() {
   log(`Connecting to ${CORE_WS_URL}`);
   const ws = new WebSocket(CORE_WS_URL, {
     headers: SECRET ? { "x-runner-secret": SECRET } : {},
   });
+  coreWs = ws;
 
   ws.on("open", () => {
     log("Connected to core");

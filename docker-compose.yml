@@ -6,6 +6,15 @@ services:
       - CORE_WS_URL=${CORE_WS_URL:-ws://bot:8765}
       - RUNNER_SECRET=${RUNNER_SECRET:-}
       - RUNNER_REGION=${RUNNER_REGION:-}
+      - HEALTHCHECK_PORT=${HEALTHCHECK_PORT:-8080}
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.HEALTHCHECK_PORT||8080)+'/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
     networks:
       - fluxcord-net
 
