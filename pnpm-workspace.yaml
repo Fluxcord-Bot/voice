@@ -4,5 +4,14 @@ packages:
 allowBuilds:
   "@discordjs/opus": true
 
+minimumReleaseAgeExclude:
+  - '@fluxerjs/builders@3.0.0'
+  - '@fluxerjs/collection@3.0.0'
+  - '@fluxerjs/core@3.0.0'
+  - '@fluxerjs/rest@3.0.0'
+  - '@fluxerjs/types@3.0.0'
+  - '@fluxerjs/util@3.0.0'
+  - '@fluxerjs/ws@3.0.0'
+
 overrides:
   brace-expansion: 1.1.12
