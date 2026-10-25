@@ -103,12 +103,13 @@ const CHANNELS = 2;
 const FRAME_SIZE = 960;
 const FRAME_SAMPLES = FRAME_SIZE * CHANNELS;
 const FRAME_DURATION_MS = 20;
-const RECONNECT_TIMEOUT_MS = 15_000;
+const RECONNECT_TIMEOUT_MS = 45_000;
 const MIN_BUFFER_DELAY = 3;
 const STARTUP_BUFFER_DELAY = 4;
 const MAX_BUFFER_DELAY = 8;
 const MAX_BUFFER_DEPTH = 12;
 const MAX_CONCEALMENT_FRAMES = 1;
+const SPURT_GAP_MS = 100;
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
@@ -159,23 +160,29 @@ class JitterBuffer {
   push(frame) {
     const now = Date.now();
     if (this.lastArrivalAt !== 0) {
-      const deviation = Math.abs((now - this.lastArrivalAt) - FRAME_DURATION_MS);
-      this.jitterMs = this.jitterMs === 0 ? deviation : (this.jitterMs * 0.8) + (deviation * 0.2);
-      const adaptiveDelay = clamp(
-        STARTUP_BUFFER_DELAY + Math.ceil(this.jitterMs / FRAME_DURATION_MS),
-        MIN_BUFFER_DELAY,
-        MAX_BUFFER_DELAY,
-      );
-      if (adaptiveDelay > this.targetDelay) {
-        this.targetDelay = adaptiveDelay;
+      const gap = now - this.lastArrivalAt;
+      if (gap > SPURT_GAP_MS) {
+        this.jitterMs = 0;
+        this.targetDelay = MIN_BUFFER_DELAY;
         this.stableTicks = 0;
+      } else {
+        const deviation = Math.abs(gap - FRAME_DURATION_MS);
+        this.jitterMs = this.jitterMs === 0 ? deviation : (this.jitterMs * 0.8) + (deviation * 0.2);
+        const adaptiveDelay = clamp(
+          STARTUP_BUFFER_DELAY + Math.ceil(this.jitterMs / FRAME_DURATION_MS),
+          MIN_BUFFER_DELAY,
+          MAX_BUFFER_DELAY,
+        );
+        if (adaptiveDelay > this.targetDelay) {
+          this.targetDelay = adaptiveDelay;
+          this.stableTicks = 0;
+        }
       }
     }
     this.lastArrivalAt = now;
     if (this.queue.length >= MAX_BUFFER_DEPTH) {
       this.queue.shift();
       this.started = true;
-      this.targetDelay = Math.min(MAX_BUFFER_DELAY, this.targetDelay + 1);
       this.stableTicks = 0;
     }
     this.queue.push(frame);
@@ -203,29 +210,29 @@ class JitterBuffer {
     }
     if (this.concealmentFrames < MAX_CONCEALMENT_FRAMES) {
       this.concealmentFrames += 1;
-      return concealFrame(this.lastFrame, this.silenceFrame, this.concealmentFrames);
+      return concealFrame(this.lastFrame, this.silenceFrame);
     }
     this.started = false;
     this.stableTicks = 0;
     this.concealmentFrames = 0;
-    this.targetDelay = Math.min(MAX_BUFFER_DELAY, this.targetDelay + 1);
     return this.silenceFrame;
   }
 }
-function concealFrame(frame, silenceFrame, concealmentFrames) {
+function concealFrame(frame, silenceFrame) {
   if (frame === silenceFrame) return silenceFrame;
-  const gain = concealmentFrames === 1 ? 0.35 : 0.15;
   const concealed = new Int16Array(frame.length);
-  for (let i = 0; i < frame.length; i++) {
-    concealed[i] = Math.trunc(frame[i] * gain);
+  const n = frame.length;
+  for (let i = 0; i < n; i++) {
+    concealed[i] = Math.trunc(frame[i] * (1 - (i + 1) / n));
   }
   return concealed;
 }
 function mixFrames(frames) {
   const out = new Int16Array(FRAME_SAMPLES);
+  const gain = frames.length > 1 ? 1 / frames.length : 1;
   for (const f of frames) {
     for (let i = 0; i < FRAME_SAMPLES; i++) {
-      out[i] = Math.max(-32768, Math.min(32767, out[i] + (f[i] ?? 0)));
+      out[i] = Math.max(-32768, Math.min(32767, out[i] + (f[i] ?? 0) * gain));
     }
   }
   return out;
@@ -340,8 +347,18 @@ async function main() {
   const subscriptionPipelines = new Map();
   const SILENCE = new Int16Array(FRAME_SAMPLES);
   const discordBuffers = new Map();
+  const discordAccum = new Map();
+  const subscriptionIdleTimers = new Map();
+  function cancelSubscriptionCleanup(userId) {
+    const timer = subscriptionIdleTimers.get(userId);
+    if (!timer) return;
+    clearTimeout(timer);
+    subscriptionIdleTimers.delete(userId);
+  }
   function ensureDiscordSubscription(userId) {
-    if (!userId || userId === DISCORD_USER_ID || activeSubscriptions.has(userId)) return;
+    if (!userId || userId === DISCORD_USER_ID) return;
+    cancelSubscriptionCleanup(userId);
+    if (activeSubscriptions.has(userId)) return;
     activeSubscriptions.add(userId);
     discordBuffers.set(userId, new JitterBuffer(SILENCE));
     vlog(`Subscribed to Discord audio: ${userId}`);
@@ -355,11 +372,20 @@ async function main() {
     });
     subscriptionPipelines.set(userId, { opusStream, decoder, cleanedUp: false });
     opusStream.pipe(decoder);
-    decoder.on("data", ( pcm) => {
+    decoder.on("data", (pcm) => {
       const buffer = discordBuffers.get(userId);
       if (!buffer) return;
-      const frame = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2).slice();
-      buffer.push(frame);
+      const incoming = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
+      let combined = discordAccum.get(userId) ?? new Int16Array(0);
+      const merged = new Int16Array(combined.length + incoming.length);
+      merged.set(combined);
+      merged.set(incoming, combined.length);
+      combined = merged;
+      while (combined.length >= FRAME_SAMPLES) {
+        buffer.push(combined.slice(0, FRAME_SAMPLES));
+        combined = combined.slice(FRAME_SAMPLES);
+      }
+      discordAccum.set(userId, combined);
     });
     const cleanup = () => cleanupDiscordSubscription(userId);
     decoder.once("close", cleanup);
@@ -385,12 +411,22 @@ async function main() {
     }
     activeSubscriptions.delete(userId);
     discordBuffers.delete(userId);
+    cancelSubscriptionCleanup(userId);
+    discordAccum.delete(userId);
   }
   receiver.speaking.on("start", (userId) => {
     ensureDiscordSubscription(userId);
   });
   receiver.speaking.on("end", (userId) => {
-    cleanupDiscordSubscription(userId);
+    cancelSubscriptionCleanup(userId);
+    subscriptionIdleTimers.set(
+      userId,
+      setTimeout(() => {
+        subscriptionIdleTimers.delete(userId);
+        if (receiver.speaking.users.has(userId)) return;
+        cleanupDiscordSubscription(userId);
+      }, 30_000),
+    );
   });
   const discordPlayer = createAudioPlayer();
   discordConnection.subscribe(discordPlayer);
@@ -499,32 +535,29 @@ async function main() {
   let nextMixAt = Date.now() + FRAME_DURATION_MS;
   const discordSpeakingSweep = setInterval(hydrateDiscordSpeakingUsers, 1000);
   const mixTick = () => {
-    if (lkReady && discordBuffers.size > 0) {
+    if (lkReady) {
       const dFrames = [];
       for (const [, buffer] of discordBuffers) {
         const frame = buffer.pull();
         if (frame) dFrames.push(frame);
       }
-      if (dFrames.length > 0) {
-        const mixed = mixFrames(dFrames);
-        lkSource.captureFrame(new AudioFrame(mixed, SAMPLE_RATE, CHANNELS, FRAME_SIZE)).catch(() => {});
-      }
+      const mixed = dFrames.length > 0 ? mixFrames(dFrames) : SILENCE;
+      lkSource.captureFrame(new AudioFrame(mixed, SAMPLE_RATE, CHANNELS, FRAME_SIZE)).catch(() => {});
     }
-    if (fluxerBuffers.size > 0) {
+    if (room.remoteParticipants.size > 0) {
       const fFrames = [];
       for (const [, buffer] of fluxerBuffers) {
         const frame = buffer.pull();
         if (frame) fFrames.push(frame);
       }
-      if (fFrames.length > 0) {
-        const mixed = mixFrames(fFrames);
-        const buf = Buffer.from(mixed.buffer, mixed.byteOffset, mixed.byteLength);
-        if (!pcmPassthrough.writableEnded) pcmPassthrough.write(buf);
-      }
+      const mixed = fFrames.length > 0 ? mixFrames(fFrames) : SILENCE;
+      const buf = Buffer.from(mixed.buffer, mixed.byteOffset, mixed.byteLength);
+      if (!pcmPassthrough.writableEnded) pcmPassthrough.write(buf);
     }
     nextMixAt += FRAME_DURATION_MS;
-    const delay = Math.max(0, nextMixAt - Date.now());
-    mixTimer = setTimeout(mixTick, delay);
+    const now = Date.now();
+    if (nextMixAt < now - FRAME_DURATION_MS * 2) nextMixAt = now + FRAME_DURATION_MS;
+    mixTimer = setTimeout(mixTick, Math.max(0, nextMixAt - now));
   };
   mixTimer = setTimeout(mixTick, FRAME_DURATION_MS);
   room.on(RoomEvent.TrackSubscribed, (track, pub, participant) => {
@@ -640,6 +673,8 @@ async function main() {
     if (livekitRecoveryTimer) clearTimeout(livekitRecoveryTimer);
     if (discordRecoveryTimer) clearTimeout(discordRecoveryTimer);
     clearInterval(discordSpeakingSweep);
+    for (const timer of subscriptionIdleTimers.values()) clearTimeout(timer);
+    subscriptionIdleTimers.clear();
     if (startupTimeout) clearTimeout(startupTimeout);
     for (const userId of [...activeSubscriptions]) {
       cleanupDiscordSubscription(userId);
