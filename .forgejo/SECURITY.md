@@ -1,0 +1,1 @@
+packages/core/.forgejo/SECURITY.md
