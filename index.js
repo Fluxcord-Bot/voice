@@ -23,6 +23,7 @@ import DiscordOpus from "@discordjs/opus";
 import prism from "prism-media";
 import { PassThrough } from "node:stream";
 const VERBOSE = process.env.VOICE_VERBOSE === "1";
+const FLUXER_ONLY = process.env.FLUXER_ONLY === "1";
 const EXIT_STALE_ENDPOINT = 3;
 const EXIT_STALE_TOKEN = 7;
 function vlog(msg) {
@@ -259,7 +260,7 @@ function mixFrames(frames) {
   return out;
 }
 async function main() {
-  assertNativeOpusAvailable();
+  if (!FLUXER_ONLY) assertNativeOpusAvailable();
   const INITIAL_JOIN_ATTEMPTS = 3;
   const INITIAL_JOIN_TIMEOUT_MS = 15_000;
   function createDiscordConnection() {
@@ -277,87 +278,92 @@ async function main() {
       selfMute: false,
     });
   }
-  let discordConnection = createDiscordConnection();
-  discordConnection.on("stateChange", (oldState, newState) => {
-    if (oldState.status !== newState.status) {
-      log(`Discord voice state ${oldState.status} -> ${newState.status}`);
-    }
-  });
-  let joined = false;
-  for (let attempt = 1; attempt <= INITIAL_JOIN_ATTEMPTS; attempt += 1) {
-    try {
-      await waitForDiscordReady(
-        discordConnection,
-        INITIAL_JOIN_TIMEOUT_MS,
-        `initial connect attempt ${attempt}/${INITIAL_JOIN_ATTEMPTS}`,
-      );
-      joined = true;
-      break;
-    } catch (error) {
-      const message = messageOf(error);
-      log(`Discord voice join failed: ${message}`);
-      if (isStaleEndpointMessage(message)) throw withExitCode(error, EXIT_STALE_ENDPOINT);
-      if (attempt === INITIAL_JOIN_ATTEMPTS) throw error;
-      try {
-        discordConnection.destroy(false);
-      } catch {}
-      await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
-      discordConnection.removeAllListeners("stateChange");
-      discordConnection = createDiscordConnection();
-      discordConnection.on("stateChange", (oldState, newState) => {
-        if (oldState.status !== newState.status) {
-          log(`Discord voice state ${oldState.status} -> ${newState.status}`);
-        }
-      });
-    }
-  }
-  if (!joined) throw new Error("Discord voice join exhausted all attempts");
-  log("Discord voice connected");
-  let reconnectingDiscordVoice = false;
+  let discordConnection = null;
   let discordRecoveryTimer = null;
-  discordConnection.removeAllListeners("stateChange");
-  discordConnection.on("stateChange", async (oldState, newState) => {
-    if (oldState.status !== newState.status) {
-      log(`Discord voice state ${oldState.status} -> ${newState.status}`);
+  if (!FLUXER_ONLY) {
+    discordConnection = createDiscordConnection();
+    discordConnection.on("stateChange", (oldState, newState) => {
+      if (oldState.status !== newState.status) {
+        log(`Discord voice state ${oldState.status} -> ${newState.status}`);
+      }
+    });
+    let joined = false;
+    for (let attempt = 1; attempt <= INITIAL_JOIN_ATTEMPTS; attempt += 1) {
+      try {
+        await waitForDiscordReady(
+          discordConnection,
+          INITIAL_JOIN_TIMEOUT_MS,
+          `initial connect attempt ${attempt}/${INITIAL_JOIN_ATTEMPTS}`,
+        );
+        joined = true;
+        break;
+      } catch (error) {
+        const message = messageOf(error);
+        log(`Discord voice join failed: ${message}`);
+        if (isStaleEndpointMessage(message)) throw withExitCode(error, EXIT_STALE_ENDPOINT);
+        if (attempt === INITIAL_JOIN_ATTEMPTS) throw error;
+        try {
+          discordConnection.destroy(false);
+        } catch {}
+        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+        discordConnection.removeAllListeners("stateChange");
+        discordConnection = createDiscordConnection();
+        discordConnection.on("stateChange", (oldState, newState) => {
+          if (oldState.status !== newState.status) {
+            log(`Discord voice state ${oldState.status} -> ${newState.status}`);
+          }
+        });
+      }
     }
-    if (newState.status === VoiceConnectionStatus.Ready) {
-      if (discordRecoveryTimer) {
-        clearTimeout(discordRecoveryTimer);
-        discordRecoveryTimer = null;
+    if (!joined) throw new Error("Discord voice join exhausted all attempts");
+    log("Discord voice connected");
+    let reconnectingDiscordVoice = false;
+    discordConnection.removeAllListeners("stateChange");
+    discordConnection.on("stateChange", async (oldState, newState) => {
+      if (oldState.status !== newState.status) {
+        log(`Discord voice state ${oldState.status} -> ${newState.status}`);
       }
-    } else if (
-      newState.status === VoiceConnectionStatus.Connecting ||
-      newState.status === VoiceConnectionStatus.Signalling ||
-      newState.status === VoiceConnectionStatus.Disconnected
-    ) {
-      if (!discordRecoveryTimer) {
-        discordRecoveryTimer = setTimeout(() => {
-          log("Discord voice did not recover in time, restarting bridge");
-          process.exit(4);
-        }, RECONNECT_TIMEOUT_MS);
+      if (newState.status === VoiceConnectionStatus.Ready) {
+        if (discordRecoveryTimer) {
+          clearTimeout(discordRecoveryTimer);
+          discordRecoveryTimer = null;
+        }
+      } else if (
+        newState.status === VoiceConnectionStatus.Connecting ||
+        newState.status === VoiceConnectionStatus.Signalling ||
+        newState.status === VoiceConnectionStatus.Disconnected
+      ) {
+        if (!discordRecoveryTimer) {
+          discordRecoveryTimer = setTimeout(() => {
+            log("Discord voice did not recover in time, restarting bridge");
+            process.exit(4);
+          }, RECONNECT_TIMEOUT_MS);
+        }
       }
-    }
-    if (newState.status !== VoiceConnectionStatus.Disconnected || reconnectingDiscordVoice) return;
-    reconnectingDiscordVoice = true;
-    try {
-      log("Discord voice disconnected, attempting in-process rejoin");
-      const rejoinAccepted = discordConnection.rejoin();
-      if (!rejoinAccepted) {
-        throw new Error("Voice connection rejected rejoin");
+      if (newState.status !== VoiceConnectionStatus.Disconnected || reconnectingDiscordVoice) return;
+      reconnectingDiscordVoice = true;
+      try {
+        log("Discord voice disconnected, attempting in-process rejoin");
+        const rejoinAccepted = discordConnection.rejoin();
+        if (!rejoinAccepted) {
+          throw new Error("Voice connection rejected rejoin");
+        }
+        await waitForDiscordReady(discordConnection, 15_000, "rejoin");
+        log("Discord voice rejoined");
+      } catch (error) {
+        const message = messageOf(error);
+        log(`Discord voice rejoin failed: ${message}`);
+        if (isStaleEndpointMessage(message)) {
+          withExitCode(error, EXIT_STALE_ENDPOINT);
+        }
+        process.exit(error.exitCode ?? 2);
+      } finally {
+        reconnectingDiscordVoice = false;
       }
-      await waitForDiscordReady(discordConnection, 15_000, "rejoin");
-      log("Discord voice rejoined");
-    } catch (error) {
-      const message = messageOf(error);
-      log(`Discord voice rejoin failed: ${message}`);
-      if (isStaleEndpointMessage(message)) {
-        withExitCode(error, EXIT_STALE_ENDPOINT);
-      }
-      process.exit(error.exitCode ?? 2);
-    } finally {
-      reconnectingDiscordVoice = false;
-    }
-  });
+    });
+  } else {
+    log("Running in Fluxer-only mode (no Discord voice connection)");
+  }
   const roomConfigs = parseLivekitRooms();
   const roomStates = roomConfigs.map((config, index) => {
     const source = new AudioSource(SAMPLE_RATE, CHANNELS);
@@ -366,7 +372,7 @@ async function main() {
       index,
       room: new Room(),
       source,
-      track: LocalAudioTrack.createAudioTrack(`discord-audio-${index}`, source),
+      track: LocalAudioTrack.createAudioTrack(`bridge-audio-${index}`, source),
       connected: false,
       trackPublished: false,
       ready: false,
@@ -376,7 +382,7 @@ async function main() {
   });
   const anyRoomWithParticipants = () =>
     roomStates.some(state => state.room.remoteParticipants.size > 0);
-  const receiver = discordConnection.receiver;
+  const receiver = discordConnection?.receiver ?? null;
   const activeSubscriptions = new Set();
   const subscriptionPipelines = new Map();
   const SILENCE = new Int16Array(FRAME_SAMPLES);
@@ -390,6 +396,7 @@ async function main() {
     subscriptionIdleTimers.delete(userId);
   }
   function ensureDiscordSubscription(userId) {
+    if (FLUXER_ONLY || !receiver) return;
     if (!userId || userId === DISCORD_USER_ID) return;
     cancelSubscriptionCleanup(userId);
     if (activeSubscriptions.has(userId)) return;
@@ -429,6 +436,7 @@ async function main() {
     opusStream.once("error", cleanup);
   }
   function hydrateDiscordSpeakingUsers() {
+    if (FLUXER_ONLY || !receiver) return;
     for (const userId of receiver.speaking.users.keys()) {
       ensureDiscordSubscription(userId);
     }
@@ -448,31 +456,35 @@ async function main() {
     cancelSubscriptionCleanup(userId);
     discordAccum.delete(userId);
   }
-  receiver.speaking.on("start", (userId) => {
-    ensureDiscordSubscription(userId);
-  });
-  receiver.speaking.on("end", (userId) => {
-    cancelSubscriptionCleanup(userId);
-    subscriptionIdleTimers.set(
-      userId,
-      setTimeout(() => {
-        subscriptionIdleTimers.delete(userId);
-        if (receiver.speaking.users.has(userId)) return;
-        cleanupDiscordSubscription(userId);
-      }, 30_000),
-    );
-  });
-  const discordPlayer = createAudioPlayer();
-  discordConnection.subscribe(discordPlayer);
-  let pcmPassthrough = new PassThrough();
-  function startPlaying() {
+  let discordPlayer = null;
+  let pcmPassthrough = null;
+  if (!FLUXER_ONLY) {
+    receiver.speaking.on("start", (userId) => {
+      ensureDiscordSubscription(userId);
+    });
+    receiver.speaking.on("end", (userId) => {
+      cancelSubscriptionCleanup(userId);
+      subscriptionIdleTimers.set(
+        userId,
+        setTimeout(() => {
+          subscriptionIdleTimers.delete(userId);
+          if (receiver.speaking.users.has(userId)) return;
+          cleanupDiscordSubscription(userId);
+        }, 30_000),
+      );
+    });
+    discordPlayer = createAudioPlayer();
+    discordConnection.subscribe(discordPlayer);
     pcmPassthrough = new PassThrough();
-    discordPlayer.play(createAudioResource(pcmPassthrough, { inputType: StreamType.Raw }));
+    function startPlaying() {
+      pcmPassthrough = new PassThrough();
+      discordPlayer.play(createAudioResource(pcmPassthrough, { inputType: StreamType.Raw }));
+    }
+    discordPlayer.on("stateChange", (_, next) => {
+      if (next.status === AudioPlayerStatus.Idle) startPlaying();
+    });
+    startPlaying();
   }
-  discordPlayer.on("stateChange", (_, next) => {
-    if (next.status === AudioPlayerStatus.Idle) startPlaying();
-  });
-  startPlaying();
   const audioReaders = new Map();
   const fluxerBuffers = new Map();
   const fluxerAccum = new Map();
@@ -578,7 +590,7 @@ async function main() {
   let mixTimer = null;
   let shuttingDown = false;
   let nextMixAt = Date.now() + FRAME_DURATION_MS;
-  const discordSpeakingSweep = setInterval(hydrateDiscordSpeakingUsers, 1000);
+  const discordSpeakingSweep = FLUXER_ONLY ? null : setInterval(hydrateDiscordSpeakingUsers, 1000);
   let discordAudioSeen = false;
   let fluxerPlaybackSeen = false;
   const mixTick = () => {
@@ -626,7 +638,7 @@ async function main() {
       fluxerPlaybackSeen = true;
       log(`Playing Fluxer audio to Discord (${allFluxerFrames.length} stream${allFluxerFrames.length === 1 ? "" : "s"})`);
     }
-    if (anyRoomWithParticipants()) {
+    if (!FLUXER_ONLY && pcmPassthrough && anyRoomWithParticipants()) {
       const mixed = allFluxerFrames.length > 0 ? mixFrames(allFluxerFrames) : SILENCE;
       const buf = Buffer.from(mixed.buffer, mixed.byteOffset, mixed.byteLength);
       if (!pcmPassthrough.writableEnded) pcmPassthrough.write(buf);
@@ -771,7 +783,7 @@ async function main() {
     log("Shutting down");
     if (mixTimer) clearTimeout(mixTimer);
     if (discordRecoveryTimer) clearTimeout(discordRecoveryTimer);
-    clearInterval(discordSpeakingSweep);
+    if (discordSpeakingSweep) clearInterval(discordSpeakingSweep);
     for (const timer of subscriptionIdleTimers.values()) clearTimeout(timer);
     subscriptionIdleTimers.clear();
     if (startupTimeout) clearTimeout(startupTimeout);
@@ -781,7 +793,7 @@ async function main() {
     for (const userId of [...activeSubscriptions]) {
       cleanupDiscordSubscription(userId);
     }
-    discordConnection.destroy();
+    if (discordConnection) discordConnection.destroy();
     await Promise.all(roomStates.map(state => state.room.disconnect()));
     process.exit(0);
   }
